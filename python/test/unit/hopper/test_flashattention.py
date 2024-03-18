@@ -366,13 +366,13 @@ attention = _attention.apply
     True
 ])
 @pytest.mark.parametrize('Z, H, N_CTX, D_HEAD', [
-    # (4, 48, 128, 64),
+    (4, 48, 128, 64),
     (4, 48, 256, 64),
-    # (4, 48, 512, 64),
-    # (4, 48, 1024, 64),
-    # (4, 48, 2048, 64),
-    # (4, 48, 4096, 64),
-    # (4, 48, 1024, 128),
+    (4, 48, 512, 64),
+    (4, 48, 1024, 64),
+    (4, 48, 2048, 64),
+    (4, 48, 4096, 64),
+    (4, 48, 1024, 128),
     #  (4, 48, 8192, 64), out of memory
 ])
 @pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 8, reason="requires arch 8+") # aligned with python/triton/ops/flash_attention.py flash_attention v2 implementation
@@ -464,8 +464,9 @@ def test_op(Z, H, N_CTX, D_HEAD, is_causal, dtype=torch.float16):
 
 
 try:
-    from flash_attn.flash_attn_interface import flash_attn_func
+    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
     HAS_FLASH = True
+    print("import Tri DAO's flash atention.")
 except BaseException:
     HAS_FLASH = False
 
@@ -474,13 +475,11 @@ BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
 configs = [
     triton.testing.Benchmark(
         x_names=['N_CTX'],
-        # TODO (yiakwy)
-        # x_vals=[2**i for i in range(10, 14)],
-        x_vals=[1024,],
+        x_vals=[2**i for i in range(10, 14)],
         line_arg='provider',
         line_vals=['triton', 'triton_causal_attention'] + (['flash'] if HAS_FLASH else []),
         line_names=['Triton', 'Triton_Causal_Attention'] + (['Flash'] if HAS_FLASH else []),
-        styles=[('red', '-'), ('blue', '-')],
+        styles=[('red', '-'), ('blue', '-'), ('white', 'dashdot')],
         ylabel='ms',
         plot_name=f'fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-{mode}',
         args={
@@ -528,7 +527,7 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, mode, provider, dtype=torch.f
         cu_seqlens = torch.zeros((BATCH + 1, ), device=device, dtype=torch.int32)
         cu_seqlens[1:] = lengths.cumsum(0)
         qkv = torch.randn((BATCH * N_CTX, 3, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
-        fn = lambda: flash_attn_func(qkv, cu_seqlens, 0., N_CTX, causal=True)
+        fn = lambda: flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, N_CTX, 0., causal=True)
         if mode == 'bwd':
             o = fn()
             do = torch.randn_like(o)
