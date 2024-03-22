@@ -107,7 +107,6 @@ def _fwd_kernel_without_tma(
     
     # initialize offsets
     rows_q = tl.arange(0, BLOCK_M)
-    cols_q = tl.arange(0, BLOCK_DMODEL)
     offs_m = start_m * BLOCK_M + rows_q # will be updated for causual attention
     offs_n = tl.arange(0, BLOCK_N)
     # initialize pointer to m and l
@@ -126,7 +125,7 @@ def _fwd_kernel_without_tma(
     tl.store(l_ptrs, m_i + tl.math.log2(l_i))
     
     # TODO (yiakwy) : inplace
-    # write back O # write tl.program_id(0) * BLOCK_M
+    # write back O with tl.program_id(0) * BLOCK_M
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
         shape=(N_CTX, BLOCK_DMODEL),
@@ -315,6 +314,7 @@ def _bwd_preprocess(
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_n = tl.arange(0, D_HEAD)
     # load
+    # (BLOCK_M, EMB_D), row major vectors
     o = tl.load(Out + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
     do = tl.load(DO + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
     # compute
@@ -331,22 +331,20 @@ def _bwd_kernel_one_col_block(Q, K, V, sm_scale, qk_scale,  #
                               D,  #
                               Q_block_ptr, K_block_ptr, V_block_ptr,  #
                               DO_block_ptr, DQ_block_ptr, DK_block_ptr, DV_block_ptr,  #
-                              stride_dqa, stride_qz, stride_qh, stride_qm, stride_qk,  #
+                              stride_dqa, #
+                              stride_qz, stride_qh, stride_qm, stride_qk,  #
                               stride_kz, stride_kh, stride_kn, stride_kk,  #
                               stride_vz, stride_vh, stride_vn, stride_vk,  #
                               Z, H, N_CTX,  #
-                              off_h, off_z, off_hz, start_n, num_block,  #
+                              off_h, off_z, off_hz, start_n, num_block_n,  #
                               BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,  #
                               BLOCK_N: tl.constexpr,  #
                               SEQUENCE_PARALLEL: tl.constexpr,  #
-                              CAUSAL: tl.constexpr,  #
+                              IS_CAUSAL: tl.constexpr,  #
                               MMA_V3: tl.constexpr  #
                               ):
-    if CAUSAL:
-        lo = start_n * BLOCK_M
-    else:
-        lo = 0
-
+    lo = (start_n * BLOCK_M) % N_CTX if IS_CAUSAL else 0
+    
     Q_offset = (off_z * stride_qz + off_h * stride_qh) // stride_qm
     DQ_offset = off_z * stride_qz + off_h * stride_qh
     K_offset = (off_z * stride_kz + off_h * stride_kh) // stride_kn
@@ -356,72 +354,240 @@ def _bwd_kernel_one_col_block(Q, K, V, sm_scale, qk_scale,  #
     DQ_offset = DQ_offset // stride_qm
 
     Q_block_ptr = tl.advance(Q_block_ptr, (lo + Q_offset, 0))
-    K_block_ptr = tl.advance(K_block_ptr, (start_n * BLOCK_M + K_offset, 0))
-    V_block_ptr = tl.advance(V_block_ptr, (start_n * BLOCK_M + V_offset, 0))
+    K_block_ptr = tl.advance(K_block_ptr, (start_n * BLOCK_N + K_offset, 0))
+    V_block_ptr = tl.advance(V_block_ptr, (start_n * BLOCK_N + V_offset, 0))
+    
     DO_block_ptr = tl.advance(DO_block_ptr, (lo + Q_offset, 0))
     DQ_block_ptr = tl.advance(DQ_block_ptr, (lo + DQ_offset, 0))
-    DK_block_ptr = tl.advance(DK_block_ptr, (start_n * BLOCK_M + K_offset, 0))
-    DV_block_ptr = tl.advance(DV_block_ptr, (start_n * BLOCK_M + V_offset, 0))
+    
+    DK_block_ptr = tl.advance(DK_block_ptr, (start_n * BLOCK_N + K_offset, 0))
+    DV_block_ptr = tl.advance(DV_block_ptr, (start_n * BLOCK_N + V_offset, 0))
 
     # initialize row/col offsets
-    offs_n = start_n * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_m = tl.arange(0, BLOCK_N)
+    offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    
     # pointer to row-wise quantities in value-like data
     D_ptrs = D + off_hz * N_CTX
     l_ptrs = L + off_hz * N_CTX
     # initialize dv amd dk
-    dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-    dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    # NOTE dv is an accumulator, see analysis below, hence FP32 is selected
+    dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
+    # NOTE Note dk is an accumulator, see analysis below, hence FP32 is selected
+    dk = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
+    
     # k and v stay in SRAM throughout
+    # load (BLOCK_SIZE_N, EMB_D), at start_n (jth) columns (rowswise if K is not transposed) of K
     k = tl.load(K_block_ptr)
+    # load (BLOCK_SIZE_N, EMB_D), at start_n (jth) rows of V
     v = tl.load(V_block_ptr)
+            
     # loop over rows
-    for start_m in range(lo, num_block * BLOCK_M, BLOCK_M):
+    hi = N_CTX
+    for start_m in range(lo, hi, BLOCK_M):
         offs_m_curr = start_m + offs_m
         # load q, k, v, do on-chip
+        # load (BLOCK_SIZE_M, EMB_D), at start_m (ith) rows of Q
         q = tl.load(Q_block_ptr)
+        l_i = tl.load(l_ptrs + offs_m_curr)
         # recompute p = softmax(qk, dim=-1).T
         # NOTE: `do` is pre-divided by `l`; no normalization here
-        if CAUSAL:
-            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.0), float("-inf"))
-        else:
-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, tl.trans(k))
+        
+        # -- Recompute Stage Begin --
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=q.dtype)
+        # TODO (yiakwy) : causal mask means qk_ij (j>=i) has no contribution to output
+        if IS_CAUSAL:
+            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
+        qk += tl.dot(q, tl.trans(k), allow_tf32=True)
         qk *= qk_scale
-        l_i = tl.load(l_ptrs + offs_m_curr)
         p = tl.math.exp2(qk - l_i[:, None])
+        
+        # TODO (yiakwy) : missing dropout
+        
+        # -- Recompute Stage End -- 
+        
         # compute dv
         do = tl.load(DO_block_ptr)
+        #   [    mask   ]       [ do_1 ]
+        # ( [...p_2_j...] ).T x [ do_2 ] = dv, reduced to summation form
+        #   [...p_3_j...]       [ do_3 ]
+        # dv is an accumulator with tile of p and tile of do
+        # TDOO (yiakwy) : decide which p and do contribute to dv under causal mask
         dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do, allow_tf32=True)
-        # compute dp = dot(v, do)
-        Di = tl.load(D_ptrs + offs_m_curr)
-        # dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
+        
+        # compute dp
+        # [ do_1 ]
+        # [ do_2 ] x [ v_1.T v_2.T v_3.T ] = ( dp_ij ), dp_ij = do_i x v_j.T
+        # [ do_3 ]
         dp = tl.dot(do, tl.trans(v), allow_tf32=True)
-        # compute ds = p * (dp - delta[:, None])
+        
+        # compute ds [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        Di = tl.load(D_ptrs + offs_m_curr)
+        # ds_ij = p_ij .* (dp_ij - Di[:, None])
         ds = (p * (dp - Di[:, None]) * sm_scale).to(Q.dtype.element_ty)
-        # compute dk = dot(ds.T, q)
+        
+        # compute dk
+        #   [...ds_1_j...]       [ q_1 ]
+        # ( [...ds_2_j...] ).T x [ q_2 ] = dk, reduced to summation form
+        #   [...ds_3_j...]       [ q_3 ]
+        # dk is an accumulator with tile of ds_ij and tile of q_i
+        # TDOO (yiakwy) : decide which ds and q contribute to dk under causal mask
         dk += tl.dot(tl.trans(ds), q, allow_tf32=True)
+        
         # compute dq
+        #                            [ k_0 ]
+        #   [ds_i_1 ds_i_2 ds_i_3] x [ k_1 ] = sum ( ds_ij * k_j ) (Note K is not transposed here)
+        #                            [ k_2 ]
+        # hence dq is an global accumulator of ds_ij * k_j for different column j
         if not SEQUENCE_PARALLEL:
             dq = tl.load(DQ_block_ptr)
             dq += tl.dot(ds, k, allow_tf32=True)
-            tl.store(DQ_block_ptr, dq.to(Q.dtype.element_ty))
+            if dq.dtype != Q.dtype.element_ty:
+                dq = dq.to(Q.dtype.element_ty)
+            tl.store(DQ_block_ptr, dq)
         elif SEQUENCE_PARALLEL:
             if MMA_V3:
                 dq = tl.dot(ds, k, allow_tf32=True)
             else:
                 # not work with mma v3, because M % 64 != 0
                 dq = tl.trans(tl.dot(tl.trans(k), tl.trans(ds), allow_tf32=True))
-            tl.store(DQ_block_ptr, dq.to(Q.dtype.element_ty))
+            if dq.dtype != Q.dtype.element_ty:
+                dq = dq.to(Q.dtype.element_ty)
+            tl.store(DQ_block_ptr, dq)
 
         # increment pointers
         DQ_block_ptr = tl.advance(DQ_block_ptr, (BLOCK_M, 0))
         Q_block_ptr = tl.advance(Q_block_ptr, (BLOCK_M, 0))
         DO_block_ptr = tl.advance(DO_block_ptr, (BLOCK_M, 0))
+        
     # write-back
     tl.store(DV_block_ptr, dv.to(V.dtype.element_ty))
     tl.store(DK_block_ptr, dk.to(K.dtype.element_ty))
 
+
+@jit
+def _bwd_kernel_one_col_block_for_dv_dk(Q, K, V, sm_scale, qk_scale,  #
+                                        Out, DO,  #
+                                        DQ, DK, DV,  #
+                                        L,  #
+                                        D,  #
+                                        Q_block_ptr, K_block_ptr, V_block_ptr,  #
+                                        DO_block_ptr, DQ_block_ptr, DK_block_ptr, DV_block_ptr,  #
+                                        stride_dqa, stride_qz, stride_qh, stride_qm, stride_qk,  #
+                                        stride_kz, stride_kh, stride_kn, stride_kk,  #
+                                        stride_vz, stride_vh, stride_vn, stride_vk,  #
+                                        Z, H, N_CTX,  #
+                                        off_h, off_z, off_hz, start_n, num_block_n,  #
+                                        BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,  #
+                                        BLOCK_N: tl.constexpr,  #
+                                        SEQUENCE_PARALLEL: tl.constexpr,  #
+                                        IS_CAUSAL: tl.constexpr,  #
+                                        MMA_V3: tl.constexpr  #
+                                        ):
+    # NOTE(yiakwy) if BLOCK_M != BLOCK_N, the load blance changed
+    lo = (start_n * BLOCK_M) % N_CTX if IS_CAUSAL else 0
+    
+    # advanced pointers
+    DQ_offset = (start_n * stride_dqa + off_z * stride_qz + off_h * stride_qh) // stride_qm    
+    DQ_block_ptr = tl.advance(DQ_block_ptr, (lo + DQ_offset, 0))
+    Q_block_ptr = tl.advance(Q_block_ptr,   (lo, 0))
+    DO_block_ptr = tl.advance(DO_block_ptr, (lo, 0))
+
+    # initialize row/col offsets
+    offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+        
+    # pointer to row-wise quantities in value-like data
+    D_ptrs = D + off_hz * N_CTX
+    l_ptrs = L + off_hz * N_CTX
+    
+    # initialize dv amd dk
+    # NOTE dv is an accumulator, see analysis below, hence FP32 is selected
+    dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
+    # NOTE dk is an accumulator, see analysis below, hence FP32 is selected
+    dk = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
+    
+    # k and v stay in SRAM throughout
+    # load (BLOCK_SIZE_N, EMB_D), at start_n (jth) columns (rowswise if K is not transposed) of K
+    k = tl.load(K_block_ptr)
+    # load (BLOCK_SIZE_N, EMB_D), at start_n (jth) rows of V
+    v = tl.load(V_block_ptr)
+        
+    # loop over rows
+    hi = N_CTX
+    for start_m in range(lo, hi, BLOCK_M):
+        offs_m_curr = start_m + offs_m
+        # load q, k, v, do on-chip
+        # load (BLOCK_SIZE_M, EMB_D), at start_m (ith) rows of Q
+        q = tl.load(Q_block_ptr)
+        l_i = tl.load(l_ptrs + offs_m_curr)
+        # recompute p = softmax(qk, dim=-1).T
+        # NOTE: `do` is pre-divided by `l`; no normalization here
+        
+        # -- Recompute Stage Begin --
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=q.dtype)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
+        qk += tl.dot(q, tl.trans(k), allow_tf32=True)
+        qk *= qk_scale
+        p = tl.math.exp2(qk - l_i[:, None])
+                        
+        # TODO (yiakwy) : missing dropout
+        
+        # -- Recompute Stage End -- 
+        
+        # compute dv
+        do = tl.load(DO_block_ptr)
+        #   [    mask   ]       [ do_1 ]
+        # ( [...p_2_j...] ).T x [ do_2 ] = dv, reduced to summation form
+        #   [...p_3_j...]       [ do_3 ]
+        # dv is an accumulator with tile of p and tile of do
+        dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do, allow_tf32=True)
+        
+        # compute dp
+        # [ do_1 ]
+        # [ do_2 ] x [ v_1.T v_2.T v_3.T ] = ( dp_ij ), dp_ij = do_i x v_j.T
+        # [ do_3 ]
+        dp = tl.dot(do, tl.trans(v), allow_tf32=True)
+        
+        # compute ds [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        Di = tl.load(D_ptrs + offs_m_curr)
+        # ds_ij = p_ij .* (dp_ij - Di[:, None])
+        ds = (p * (dp - Di[:, None]) * sm_scale).to(Q.dtype.element_ty)
+        
+        # compute dk
+        #   [...ds_1_j...]       [ q_1 ]
+        # ( [...ds_2_j...] ).T x [ q_2 ] = dk, reduced to summation form
+        #   [...ds_3_j...]       [ q_3 ]
+        # dk is an accumulator with tile of ds_ij and tile of q_i
+        dk += tl.dot(tl.trans(ds), q, allow_tf32=True)
+        
+        # compute dq
+        #                            [ k_0 ]
+        #   [ds_i_1 ds_i_2 ds_i_3] x [ k_1 ] = sum ( ds_ij * k_j ) (Note K is not transposed here)
+        #                            [ k_2 ]
+        # hence dq is an global accumulator of ds_ij * k_j for different column j
+        # TODO (yiakwy) : balance op store to facsilitate load/store/compute overlap
+        # TODO (yiakwy) : decide which ds and k contribute to dq under causal mask
+        if MMA_V3:
+            dq = tl.dot(ds, k, allow_tf32=True)
+        else:
+            # not work with mma v3, because M % 64 != 0
+            dq = tl.trans(tl.dot(tl.trans(k), tl.trans(ds), allow_tf32=True))
+        # TODO (yiakwy) : reduce store
+        if dq.dtype != Q.dtype.element_ty:
+            dq = dq.to(Q.dtype.element_ty)
+        # store the partial dq on the replica dimension
+        tl.store(DQ_block_ptr, dq)
+
+        # increment pointers
+        DQ_block_ptr = tl.advance(DQ_block_ptr, (BLOCK_M, 0))
+        Q_block_ptr = tl.advance(Q_block_ptr, (BLOCK_M, 0))
+        DO_block_ptr = tl.advance(DO_block_ptr, (BLOCK_M, 0))
+        
+    # write-back
+    tl.store(DV_block_ptr, dv.to(V.dtype.element_ty))
+    tl.store(DK_block_ptr, dk.to(K.dtype.element_ty))
 
 @jit
 def _bwd_kernel(Q, K, V, sm_scale,  #
@@ -438,7 +604,7 @@ def _bwd_kernel(Q, K, V, sm_scale,  #
                 BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,  #
                 BLOCK_N: tl.constexpr,  #
                 SEQUENCE_PARALLEL: tl.constexpr,  #
-                CAUSAL: tl.constexpr,  #
+                IS_CAUSAL: tl.constexpr,  #
                 MMA_V3: tl.constexpr  #
                 ):
     qk_scale = sm_scale * 1.44269504
@@ -459,7 +625,7 @@ def _bwd_kernel(Q, K, V, sm_scale,  #
         shape=(Z_H_N_CTX, BLOCK_DMODEL),
         strides=(stride_kn, stride_kk),
         offsets=(0, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
@@ -467,7 +633,7 @@ def _bwd_kernel(Q, K, V, sm_scale,  #
         shape=(Z_H_N_CTX, BLOCK_DMODEL),
         strides=(stride_vn, stride_vk),
         offsets=(0, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0),
     )
     DO_block_ptr = tl.make_block_ptr(
@@ -502,7 +668,7 @@ def _bwd_kernel(Q, K, V, sm_scale,  #
         shape=(Z_H_N_CTX, BLOCK_DMODEL),
         strides=(stride_kn, stride_kk),
         offsets=(0, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0),
     )
     DV_block_ptr = tl.make_block_ptr(
@@ -510,7 +676,7 @@ def _bwd_kernel(Q, K, V, sm_scale,  #
         shape=(Z_H_N_CTX, BLOCK_DMODEL),
         strides=(stride_vn, stride_vk),
         offsets=(0, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0),
     )
 
@@ -531,7 +697,7 @@ def _bwd_kernel(Q, K, V, sm_scale,  #
                                       BLOCK_M=BLOCK_M, BLOCK_DMODEL=BLOCK_DMODEL,  #
                                       BLOCK_N=BLOCK_N,  #
                                       SEQUENCE_PARALLEL=SEQUENCE_PARALLEL,  #
-                                      CAUSAL=CAUSAL,  #
+                                      IS_CAUSAL=IS_CAUSAL,  #
                                       MMA_V3=MMA_V3  #
                                       )
     else:
@@ -550,9 +716,118 @@ def _bwd_kernel(Q, K, V, sm_scale,  #
                                   BLOCK_M=BLOCK_M, BLOCK_DMODEL=BLOCK_DMODEL,  #
                                   BLOCK_N=BLOCK_N,  #
                                   SEQUENCE_PARALLEL=SEQUENCE_PARALLEL,  #
-                                  CAUSAL=CAUSAL,  #
+                                  IS_CAUSAL=IS_CAUSAL,  #
                                   MMA_V3=MMA_V3  #
                                   )
+
+@jit
+def _bwd_kernel_without_tma(Q, K, V, sm_scale,  #
+                            Out, DO,  #
+                            DQ, DK, DV,  #
+                            L,  #
+                            D,  #
+                            stride_dqa, #
+                            stride_qz, stride_qh, stride_qm, stride_qk,  #
+                            stride_kz, stride_kh, stride_kn, stride_kk,  #
+                            stride_vz, stride_vh, stride_vn, stride_vk,  #
+                            Z, H, N_CTX,  #
+                            Z_H_N_CTX,  #
+                            SQ_Z_H_N_CTX,  #
+                            BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,  #
+                            BLOCK_N: tl.constexpr,  #
+                            SEQUENCE_PARALLEL: tl.constexpr,  #
+                            IS_CAUSAL: tl.constexpr,  #
+                            MMA_V3: tl.constexpr  #
+                            ):
+    off_hz = tl.program_id(0)
+    start_n = tl.program_id(1)
+    
+    qk_scale = sm_scale * 1.44269504
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    qvk_offset = off_hz * stride_qh
+
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_qm, stride_qk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_kn, stride_kk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_vn, stride_vk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    DO_block_ptr = tl.make_block_ptr(
+        base=DO + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_qm, stride_qk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    
+    # NOTE DQ is of shape ( N_CTX / BLOCK_N, Z, H, N_CTX, ) where first dim N_CTX / BLOCK_N is replicated
+    # to store dq for each column partition
+    DQ_block_ptr = tl.make_block_ptr(
+        base=DQ,
+        shape=(SQ_Z_H_N_CTX, BLOCK_DMODEL),
+        strides=(stride_qm, stride_qk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    
+    DK_block_ptr = tl.make_block_ptr(
+        base=DK + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_kn, stride_kk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    DV_block_ptr = tl.make_block_ptr(
+        base=DV + qvk_offset,
+        shape=(Z_H_N_CTX, BLOCK_DMODEL),
+        strides=(stride_vn, stride_vk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+
+    num_block_n = tl.cdiv(N_CTX, BLOCK_N)
+
+    _bwd_kernel_one_col_block_for_dv_dk(Q, K, V, sm_scale, qk_scale, Out, DO,  #
+                                        DQ, DK, DV,  #
+                                        L,  #
+                                        D,  #
+                                        Q_block_ptr, K_block_ptr, V_block_ptr,  #
+                                        DO_block_ptr, DQ_block_ptr, DK_block_ptr, DV_block_ptr,  #
+                                        stride_dqa, stride_qz, stride_qh, stride_qm, stride_qk,  #
+                                        stride_kz, stride_kh, stride_kn, stride_kk,  #
+                                        stride_vz, stride_vh, stride_vn, stride_vk,  #
+                                        Z, H, N_CTX,  #
+                                        off_h, off_z, off_hz, start_n, num_block_n,  #
+                                        BLOCK_M=BLOCK_M, BLOCK_DMODEL=BLOCK_DMODEL,  #
+                                        BLOCK_N=BLOCK_N,  #
+                                        SEQUENCE_PARALLEL=SEQUENCE_PARALLEL,  #
+                                        IS_CAUSAL=IS_CAUSAL,  #
+                                        MMA_V3=MMA_V3  #
+                                        )
 
 
 class _attention(torch.autograd.Function):
@@ -651,49 +926,94 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
+        # NOTE uncomment the following lines to enable debugging triton program tile mapping
+        # import pdb
+        # pdb.set_trace()
         capability = torch.cuda.get_device_capability()
         MMA_V3 = capability[0] >= 9
-        BLOCK = 128
+        BLOCK_M = 128
+        # TODO (yiakwy) The current impl does not support BLOCK_N != BLOCK_M
+        BLOCK_N = BLOCK_M
         q, k, v, o, L = ctx.saved_tensors
         sequence_parallel = ctx.sequence_parallel
         seq_len_kv = k.shape[2]
         do = do.contiguous()
-        if sequence_parallel:
-            replicas = cdiv(seq_len_kv, BLOCK)
-            new_dq_shape = (replicas, ) + q.shape
-            dq = torch.zeros(new_dq_shape, device=q.device, dtype=q.dtype)
-        else:
-            dq = torch.zeros_like(q, dtype=q.dtype)
+
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
+        # (q.shape[0] * q.shape[1], q.shape[2]), a rowwise scalar used to compute row(S, i)
+        # d row(S,i) = row(P, i) .* (d row(P, i) - delta(i))
         delta = torch.empty_like(L)
-        _bwd_preprocess[(cdiv(q.shape[2], BLOCK) * ctx.grid[1], )](
+        _bwd_preprocess[(cdiv(q.shape[2], BLOCK_M) * ctx.grid[1],)](
             o,
             do,
             delta,
-            BLOCK_M=BLOCK,
+            BLOCK_M=BLOCK_M,
             D_HEAD=ctx.BLOCK_DMODEL,
         )
-        _bwd_kernel[(ctx.grid[1], cdiv(seq_len_kv, BLOCK) if sequence_parallel else 1)](
-            q, k, v, ctx.sm_scale,  #
-            o, do,  #
-            dq, dk, dv,  #
-            L,  #
-            delta,  #
-            o.numel(), q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
-            q.shape[0], q.shape[1], q.shape[2],  #
-            q.shape[0] * q.shape[1] * q.shape[2],  #
-            cdiv(seq_len_kv, BLOCK) * q.shape[0] * q.shape[1] * q.shape[2],  #
-            BLOCK_M=BLOCK, BLOCK_N=BLOCK,  #
-            BLOCK_DMODEL=ctx.BLOCK_DMODEL,  #
-            SEQUENCE_PARALLEL=sequence_parallel,  #
-            CAUSAL=ctx.causal,  #
-            MMA_V3=MMA_V3,  #
-            num_warps=8,  #
-            num_stages=1  #
-        )
+        
+        # distribute blocks over SMs along batchesxheads x (seq_len_kv / BLOCK_SIZE_N)
+        blocks_dim_1 = cdiv(seq_len_kv, BLOCK_N)
+        
+        if capability[0] >= 9:
+            print("old bwd")
+            if sequence_parallel:
+                replicas = cdiv(seq_len_kv, BLOCK_N)
+                new_dq_shape = (replicas, ) + q.shape
+                dq = torch.zeros(new_dq_shape, device=q.device, dtype=q.dtype)
+            else:
+                dq = torch.zeros_like(q, dtype=q.dtype)
+            grid = (ctx.grid[1], blocks_dim_1 if sequence_parallel else 1)
+            _bwd_kernel[grid](
+                q, k, v, ctx.sm_scale,  #
+                o, do,  #
+                dq, dk, dv,  #
+                L,  #
+                delta,  #
+                o.numel(), #
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+                q.shape[0], q.shape[1], q.shape[2],  #
+                q.shape[0] * q.shape[1] * q.shape[2],  #
+                blocks_dim_1 * q.shape[0] * q.shape[1] * q.shape[2],  #
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,  #
+                BLOCK_DMODEL=ctx.BLOCK_DMODEL,  #
+                SEQUENCE_PARALLEL=sequence_parallel,  #
+                IS_CAUSAL=ctx.causal,  #
+                MMA_V3=MMA_V3,  #
+                num_warps=8,  #
+                num_stages=1  #
+            )
+        else:
+            print("new bwd")
+            # TODO (yiaky) : remove this constrains
+            replicas = cdiv(seq_len_kv, BLOCK_N)
+            new_dq_shape = (replicas,) + q.shape
+            dq = torch.zeros(new_dq_shape, device=q.device, dtype=q.dtype)
+
+            grid = (ctx.grid[1], blocks_dim_1)
+            _bwd_kernel_without_tma[grid](
+                q, k, v, ctx.sm_scale,  #
+                o, do,  #
+                dq, dk, dv,  #
+                L,  #
+                delta,  #
+                o.numel(), #
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+                q.shape[0], q.shape[1], q.shape[2],  #
+                q.shape[0] * q.shape[1] * q.shape[2],  #
+                blocks_dim_1 * q.shape[0] * q.shape[1] * q.shape[2],  #
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,  #
+                BLOCK_DMODEL=ctx.BLOCK_DMODEL,  #
+                SEQUENCE_PARALLEL=True,  #
+                IS_CAUSAL=ctx.causal,  #
+                MMA_V3=MMA_V3,  #
+                num_warps=8,  #
+                num_stages=1  #
+            )
 
         if len(dq.shape) == 5:
             dq = dq.sum(dim=0)
