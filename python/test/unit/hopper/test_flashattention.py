@@ -367,11 +367,11 @@ attention = _attention.apply
 ])
 @pytest.mark.parametrize('Z, H, N_CTX, D_HEAD', [
     # (4, 48, 128, 64),
-    (4, 48, 256, 64),
+    # (4, 48, 256, 64),
     # (4, 48, 512, 64),
     # (4, 48, 1024, 64),
     # (4, 48, 2048, 64),
-    # (4, 48, 4096, 64),
+    (4, 48, 4096, 64),
     # (4, 48, 1024, 128),
     #  (4, 48, 8192, 64), out of memory
 ])
@@ -412,35 +412,42 @@ def test_op(Z, H, N_CTX, D_HEAD, is_causal, dtype=torch.float16):
             print("disable warmup when debugging tiles/block mapping...")
             do_warmup = False
     
-    # # warup up
-    # if do_warmup:
-    #     for i in range(10):
-    #         attention(q, k, v, sm_scale)
+    # warm up
+    if do_warmup:
+        for i in range(10):
+            attention(q, k, v, sm_scale)
             
-    # torch.cuda.synchronize()
-    # start.record()
-    # tri_out = attention(q, k, v, sm_scale)
-    # end.record()
+    torch.cuda.synchronize()
+    start.record()
+    tri_out = attention(q, k, v, sm_scale)
+    end.record()
     
-    # torch.cuda.synchronize()
-    # print("\n")
-    # print(f"triton attention v2                   ({Z}x{H}x{N_CTX}x{D_HEAD}) : {start.elapsed_time(end)} ms")
+    torch.cuda.synchronize()
+    print("\n")
+    print(f"triton attention v2 fwd                   ({Z}x{H}x{N_CTX}x{D_HEAD}) : {start.elapsed_time(end)} ms")
         
-    # tri_out.backward(dout)
-    # tri_dv, v.grad = v.grad.clone(), None
-    # tri_dk, k.grad = k.grad.clone(), None
-    # tri_dq, q.grad = q.grad.clone(), None
-    # # compare
-    # torch.testing.assert_close(ref_out, tri_out, atol=1e-2, rtol=0)
-    # torch.testing.assert_close(ref_dq, tri_dq, atol=1e-2, rtol=0)
-    # torch.testing.assert_close(ref_dv, tri_dv, atol=1e-2, rtol=0)
-    # torch.testing.assert_close(ref_dk, tri_dk, atol=1e-2, rtol=0)
+    torch.cuda.synchronize()
+    start.record()
+    tri_out.backward(dout)
+    end.record()
+    
+    torch.cuda.synchronize()
+    print(f"triton attention v2 bwd                   ({Z}x{H}x{N_CTX}x{D_HEAD}) : {start.elapsed_time(end)} ms")
+    
+    tri_dv, v.grad = v.grad.clone(), None
+    tri_dk, k.grad = k.grad.clone(), None
+    tri_dq, q.grad = q.grad.clone(), None
+    # compare
+    torch.testing.assert_close(ref_out, tri_out, atol=1e-2, rtol=0)
+    torch.testing.assert_close(ref_dq, tri_dq, atol=1e-2, rtol=0)
+    torch.testing.assert_close(ref_dv, tri_dv, atol=1e-2, rtol=0)
+    torch.testing.assert_close(ref_dk, tri_dk, atol=1e-2, rtol=0)
     
     # Sequence parallel partition requires gather of full length of tokens and scatter in bwd phase.
     # However, distributed attention allow (ring attention, dist attention...) much longer up to 1 million
     # of tokens of sequence length. Hence we assume sequence parallel false here.        
     if do_warmup:
-        # warup up
+        # warm up
         for i in range(10):
             causal_attention(q, k, v, is_causal, sm_scale)
     
@@ -450,9 +457,16 @@ def test_op(Z, H, N_CTX, D_HEAD, is_causal, dtype=torch.float16):
     end.record()
     
     torch.cuda.synchronize()
-    print(f"triton attention v3 with load balance ({Z}x{H}x{N_CTX}x{D_HEAD}) : {start.elapsed_time(end)} ms")
+    print(f"triton attention v3 fwd with load balance ({Z}x{H}x{N_CTX}x{D_HEAD}) : {start.elapsed_time(end)} ms")
     
+    torch.cuda.synchronize()
+    start.record()
     tri_out.backward(dout)
+    end.record()
+    
+    torch.cuda.synchronize()
+    print(f"triton attention v3 bwd with load balance ({Z}x{H}x{N_CTX}x{D_HEAD}) : {start.elapsed_time(end)} ms")
+    
     tri_dv, v.grad = v.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dq, q.grad = q.grad.clone(), None
@@ -475,7 +489,7 @@ BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
 configs = [
     triton.testing.Benchmark(
         x_names=['N_CTX'],
-        x_vals=[2**i for i in range(10, 14)],
+        x_vals=[2**i for i in range(10, 13)],
         line_arg='provider',
         line_vals=['triton', 'triton_causal_attention'] + (['flash'] if HAS_FLASH else []),
         line_names=['Triton', 'Triton_Causal_Attention'] + (['Flash'] if HAS_FLASH else []),

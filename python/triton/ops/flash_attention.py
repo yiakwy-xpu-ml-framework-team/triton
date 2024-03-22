@@ -124,7 +124,6 @@ def _fwd_kernel_without_tma(
     l_ptrs = L + off_hz * N_CTX + offs_m
     tl.store(l_ptrs, m_i + tl.math.log2(l_i))
     
-    # TODO (yiakwy) : inplace
     # write back O with tl.program_id(0) * BLOCK_M
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
@@ -482,13 +481,19 @@ def _bwd_kernel_one_col_block_for_dv_dk(Q, K, V, sm_scale, qk_scale,  #
                                         BLOCK_N: tl.constexpr,  #
                                         SEQUENCE_PARALLEL: tl.constexpr,  #
                                         IS_CAUSAL: tl.constexpr,  #
+                                        BLOCK_DIM_1: tl.constexpr,  #
+                                        STORE_DQ: tl.constexpr,  # 
                                         MMA_V3: tl.constexpr  #
                                         ):
     # NOTE(yiakwy) if BLOCK_M != BLOCK_N, the load blance changed
     lo = (start_n * BLOCK_M) % N_CTX if IS_CAUSAL else 0
     
     # advanced pointers
-    DQ_offset = (start_n * stride_dqa + off_z * stride_qz + off_h * stride_qh) // stride_qm    
+    if STORE_DQ:
+        DQ_offset = ((BLOCK_DIM_1 - start_n) * stride_dqa + off_z * stride_qz + off_h * stride_qh) // stride_qm
+    else:
+        DQ_offset = (start_n * stride_dqa + off_z * stride_qz + off_h * stride_qh) // stride_qm
+      
     DQ_block_ptr = tl.advance(DQ_block_ptr, (lo + DQ_offset, 0))
     Q_block_ptr = tl.advance(Q_block_ptr,   (lo, 0))
     DO_block_ptr = tl.advance(DO_block_ptr, (lo, 0))
@@ -570,10 +575,18 @@ def _bwd_kernel_one_col_block_for_dv_dk(Q, K, V, sm_scale, qk_scale,  #
         # TODO (yiakwy) : balance op store to facsilitate load/store/compute overlap
         # TODO (yiakwy) : decide which ds and k contribute to dq under causal mask
         if MMA_V3:
-            dq = tl.dot(ds, k, allow_tf32=True)
+            if STORE_DQ:
+                dq = tl.load(DQ_block_ptr)
+                dq += tl.dot(ds, k, allow_tf32=True)
+            else:
+                dq = tl.dot(ds, k, allow_tf32=True)
         else:
-            # not work with mma v3, because M % 64 != 0
-            dq = tl.trans(tl.dot(tl.trans(k), tl.trans(ds), allow_tf32=True))
+            if STORE_DQ:
+                dq = tl.load(DQ_block_ptr)
+                dq += tl.dot(ds, k, allow_tf32=True)
+            else:
+                # not work with mma v3, because M % 64 != 0
+                dq = tl.trans(tl.dot(tl.trans(k), tl.trans(ds), allow_tf32=True))
         # TODO (yiakwy) : reduce store
         if dq.dtype != Q.dtype.element_ty:
             dq = dq.to(Q.dtype.element_ty)
@@ -737,6 +750,8 @@ def _bwd_kernel_without_tma(Q, K, V, sm_scale,  #
                             BLOCK_N: tl.constexpr,  #
                             SEQUENCE_PARALLEL: tl.constexpr,  #
                             IS_CAUSAL: tl.constexpr,  #
+                            BLOCK_DIM_1: tl.constexpr,
+                            LOAD_BALANCE_STRATEGY: tl.constexpr,  #
                             MMA_V3: tl.constexpr  #
                             ):
     off_hz = tl.program_id(0)
@@ -785,7 +800,7 @@ def _bwd_kernel_without_tma(Q, K, V, sm_scale,  #
     # to store dq for each column partition
     DQ_block_ptr = tl.make_block_ptr(
         base=DQ,
-        shape=(SQ_Z_H_N_CTX, BLOCK_DMODEL),
+        shape=(Z_H_N_CTX, BLOCK_DMODEL),
         strides=(stride_qm, stride_qk),
         offsets=(0, 0),
         block_shape=(BLOCK_M, BLOCK_DMODEL),
@@ -826,8 +841,78 @@ def _bwd_kernel_without_tma(Q, K, V, sm_scale,  #
                                         BLOCK_N=BLOCK_N,  #
                                         SEQUENCE_PARALLEL=SEQUENCE_PARALLEL,  #
                                         IS_CAUSAL=IS_CAUSAL,  #
+                                        BLOCK_DIM_1=BLOCK_DIM_1,  #
+                                        STORE_DQ=False, 
+                                        MMA_V3=MMA_V3  #,
+                                        )
+    
+    # load balance
+    if not IS_CAUSAL or LOAD_BALANCE_STRATEGY < 0:
+        return
+
+    if BLOCK_DIM_1 - start_n == start_n:
+        return
+
+    # Do load balance
+    if LOAD_BALANCE_STRATEGY == 0:
+        # gaussian loading
+        start_n = BLOCK_DIM_1 - start_n
+    
+    # reload data
+    K_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_kn, stride_kk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_vn, stride_vk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    
+    DK_block_ptr = tl.make_block_ptr(
+        base=DK + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_kn, stride_kk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    DV_block_ptr = tl.make_block_ptr(
+        base=DV + qvk_offset,
+        shape=(Z_H_N_CTX, BLOCK_DMODEL),
+        strides=(stride_vn, stride_vk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+
+    _bwd_kernel_one_col_block_for_dv_dk(Q, K, V, sm_scale, qk_scale, Out, DO,  #
+                                        DQ, DK, DV,  #
+                                        L,  #
+                                        D,  #
+                                        Q_block_ptr, K_block_ptr, V_block_ptr,  #
+                                        DO_block_ptr, DQ_block_ptr, DK_block_ptr, DV_block_ptr,  #
+                                        stride_dqa, stride_qz, stride_qh, stride_qm, stride_qk,  #
+                                        stride_kz, stride_kh, stride_kn, stride_kk,  #
+                                        stride_vz, stride_vh, stride_vn, stride_vk,  #
+                                        Z, H, N_CTX,  #
+                                        off_h, off_z, off_hz, start_n, num_block_n,  #
+                                        BLOCK_M=BLOCK_M, BLOCK_DMODEL=BLOCK_DMODEL,  #
+                                        BLOCK_N=BLOCK_N,  #
+                                        SEQUENCE_PARALLEL=SEQUENCE_PARALLEL,  #
+                                        IS_CAUSAL=IS_CAUSAL,  #
+                                        BLOCK_DIM_1=BLOCK_DIM_1,  #
+                                        STORE_DQ=True,  #
                                         MMA_V3=MMA_V3  #
                                         )
+    pass
 
 
 class _attention(torch.autograd.Function):
@@ -856,7 +941,7 @@ class _attention(torch.autograd.Function):
         if causal:
             if load_balance_strategy == _attention.LoadBalanceStrategy.GAUSSIAN_FOLDING.value:
                 # make sure 
-                if Lq % 2 != 0:
+                if q.shape[2] % 2 != 0:
                     raise Exception("Odd Lq is not handled in guassian folding algo.")
                 
                 # treat the data of shape (Z(B), H, sequence / 2, emb_d)
@@ -922,6 +1007,7 @@ class _attention(torch.autograd.Function):
         ctx.BLOCK_DMODEL = Lk
         ctx.causal = causal
         ctx.sequence_parallel = sequence_parallel
+        ctx.load_balance_strategy = load_balance_strategy
         return o
 
     @staticmethod
@@ -954,9 +1040,8 @@ class _attention(torch.autograd.Function):
         
         # distribute blocks over SMs along batchesxheads x (seq_len_kv / BLOCK_SIZE_N)
         blocks_dim_1 = cdiv(seq_len_kv, BLOCK_N)
-        
-        if capability[0] >= 9:
-            print("old bwd")
+        reduction_dim = 0
+        if capability[0] >= 9 or not sequence_parallel:
             if sequence_parallel:
                 replicas = cdiv(seq_len_kv, BLOCK_N)
                 new_dq_shape = (replicas, ) + q.shape
@@ -986,12 +1071,34 @@ class _attention(torch.autograd.Function):
                 num_stages=1  #
             )
         else:
-            print("new bwd")
             # TODO (yiaky) : remove this constrains
-            replicas = cdiv(seq_len_kv, BLOCK_N)
+            replicas = cdiv(cdiv(seq_len_kv, 2), BLOCK_N)
+            # this is reduction friendly layout
             new_dq_shape = (replicas,) + q.shape
             dq = torch.zeros(new_dq_shape, device=q.device, dtype=q.dtype)
-
+            reduction_dim = 0
+            if ctx.causal:
+                if ctx.load_balance_strategy == _attention.LoadBalanceStrategy.GAUSSIAN_FOLDING.value:
+                    # make sure 
+                    if seq_len_kv % 2 != 0:
+                        raise Exception("Odd Lq is not handled in guassian folding algo.")
+                    
+                    # treat the data of shape (Z(B), H, sequence / 2, emb_d)
+                    if seq_len_kv < 2*BLOCK_N:
+                        BLOCK_N = cdiv(seq_len_kv, 2)
+                        
+                    blocks_dim_1 = cdiv(cdiv(seq_len_kv, 2), BLOCK_N)
+                else:
+                    raise Exception(f"Unexpected load balance strategy; valid choices : {list(_attention.LoadBalanceStrategy)}")
+            else:
+                if ctx.load_balance_strategy > 0:
+                    print("load balance ignore for non-causal attention")
+            
+            # torch.cuda.synchronize()
+            # start = torch.cuda.Event(enable_timing=True)
+            # end = torch.cuda.Event(enable_timing=True)
+            
+            # start.record()
             grid = (ctx.grid[1], blocks_dim_1)
             _bwd_kernel_without_tma[grid](
                 q, k, v, ctx.sm_scale,  #
@@ -1010,13 +1117,28 @@ class _attention(torch.autograd.Function):
                 BLOCK_DMODEL=ctx.BLOCK_DMODEL,  #
                 SEQUENCE_PARALLEL=True,  #
                 IS_CAUSAL=ctx.causal,  #
+                BLOCK_DIM_1=2*blocks_dim_1 - 1 if ctx.causal else blocks_dim_1,
+                LOAD_BALANCE_STRATEGY=ctx.load_balance_strategy,  #
                 MMA_V3=MMA_V3,  #
                 num_warps=8,  #
                 num_stages=1  #
             )
+            # end.record()
+            
+            # torch.cuda.synchronize()
+            # print(f"[backward::_bwd_kernel_without_tma] {start.elapsed_time(end)} ms")
 
+        # TODO (yiakwy) : Reduction could be extremely expensive for some layout
+        # NOTE Flash Decoding has the same problem for fwd pass
         if len(dq.shape) == 5:
-            dq = dq.sum(dim=0)
+            # torch.cuda.synchronize()
+            # start.record()
+            dq = dq.sum(dim=reduction_dim)
+            # end.record()
+            
+            # torch.cuda.synchronize()
+            # print(f"[backward::reduce] {start.elapsed_time(end)} ms")
+            
         return dq, dk, dv, None, None, None
 
 
